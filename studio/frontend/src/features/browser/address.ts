@@ -20,7 +20,7 @@ export const SEARCH_ENGINES: Record<SearchEngineId, { label: string; searchUrl: 
   yandex: {
     // Server-rendered too, so it works without scripts.
     label: "Yandex",
-    searchUrl: (query) => `https://yandex.ru/search/?text=${encodeURIComponent(query)}`,
+    searchUrl: (query) => `https://yandex.com/search/?text=${encodeURIComponent(query)}`,
   },
   brave: {
     label: "Brave Search",

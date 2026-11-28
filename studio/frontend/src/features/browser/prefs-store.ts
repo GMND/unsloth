@@ -64,7 +64,7 @@ export const useBrowserPrefsStore = create<BrowserPrefsState>()(
     (set) => ({
       openLinksInBrowser: false,
       openFilesInBrowser: true,
-      searchEngine: "yandex",
+      searchEngine: "duckduckgo",
       showFullUrl: false,
       bookmarksToolbar: "newtab",
       showBookmarkEditor: true,

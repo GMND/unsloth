@@ -192,36 +192,72 @@ _DDGS_CONNECT_TIMEOUT_LOCK = threading.Lock()
 _DDGS_PENDING = threading.local()
 
 # Tier 2 runs unless tier 1 found more than Wikipedia; engines in neither tier are never contacted.
-# Yandex leads tier 1: on networks where DuckDuckGo answers 202-empty and Brave rate-limits it is the
-# tier 1 engine that still returns results (#16664).
+# Yandex is first in the primary tier because current ddgs DuckDuckGo requests can be answered
+# with an anti-bot 202 page when they omit the browser's Accept header (#16664).
 _SEARCH_ENGINE_TIERS = (
     ("yandex", "wikipedia", "brave", "duckduckgo", "mojeek", "startpage"),
     ("grokipedia", "google", "yahoo"),
-)
 
-# Module level so preexec_fn imports nothing in the forked child (deadlock risk).
-_libc = None
-if sys.platform == "linux":
+# NATIVE BING SEARCH - replaces disabled ddgs Bing engine (commit f4ba66ca)
+# Bing has a stable HTML structure and is more permissive to automated requests.
+
+def _search_bing_native(query: str, max_results: int = 5) -> list:
+    """Query Bing directly and parse SERP results. Used as a fallback when ddgs fails."""
+    import re
+    import base64
+    import html
+    from urllib.parse import urlparse, parse_qs, quote
+    import requests
+
+    results = []
     try:
-        import ctypes
-        import ctypes.util
+        response = requests.get(
+            f"https://www.bing.com/search?q={quote(query)}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
 
-        _libc_name = ctypes.util.find_library("c")
-        if _libc_name:
-            _libc = ctypes.CDLL(_libc_name, use_errno = True)
-    except (OSError, AttributeError):
-        pass
+        for block in re.split(r'(?=<li class="b_algo)', response.text):
+            if "b_algo" not in block:
+                continue
 
-_resource = None
-if sys.platform != "win32":
-    try:
-        import resource as _resource
-    except ImportError:
-        pass
+            title_m = re.search(r'aria-label="([^"]+)"', block)
+            if not title_m:
+                continue
 
-# Pinned equal to _SANDBOX_MEDIA_TYPES by test_sandbox_files_and_storage_roots. No .svg (XSS),
-# .html or .pdf.
-_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"})
+            link_m = re.search(r'href="([^"]*ck/a[^"]*)"', block)
+            final_link = None
+            if link_m:
+                decoded = link_m.group(1).replace("&amp;", "&")
+                params = parse_qs(urlparse(decoded).query)
+                if params.get("u"):
+                    try:
+                        raw = params["u"][0]
+                        if raw.startswith("a1"):
+                            target = base64.b64decode(raw[2:]).decode("utf-8", errors="ignore")
+                            if target.startswith(("http://", "https://")):
+                                final_link = target
+                    except Exception:
+                        pass
+
+            if not final_link:
+                continue
+
+            snippet_m = re.search(r"<p[^>]*>(.*?)</p>", block, re.DOTALL)
+            snippet = html.unescape(re.sub(r"<[^>]+>", "", snippet_m.group(1)).strip()[:300]) if snippet_m else ""
+
+            results.append({"title": title_m.group(1)[:150], "href": final_link[:500], "body": snippet})
+            if len(results) >= max_results:
+                break
+    except Exception:
+        logger.warning("Native Bing search failed")
+
+    return results
 
 
 def _env_int(name: str, default: int) -> int:
@@ -19239,6 +19275,21 @@ def _web_search(
             return "Search cancelled."
         if not results:
             remaining = deadline - time.monotonic() if deadline else 5.0
+
+            # Native Bing search as primary fallback when ddgs engines fail
+            # ddgs disabled Bing/Google/Yandex engines in August 2026 (commit f4ba66ca)
+            if remaining > 0:
+                try:
+                    bing_candidates = _search_bing_native(effective_query, max_results)
+                    bing_results = _usable_search_results(bing_candidates, website_policy)
+                    if bing_results:
+                        results = bing_results
+                        logger.info("Native Bing search returned results", extra={"count": len(results)})
+                except Exception:
+                    logger.debug("Native Bing search failed", exc_info=True)
+
+            # Fall back to Wikipedia if Bing also failed
+
             allowed, _, _ = check_url_access("https://en.wikipedia.org/w/api.php", website_policy)
             if allowed and remaining > 0:
                 try:
